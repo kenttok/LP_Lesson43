@@ -1,0 +1,123 @@
+---
+- hosts: all
+  become: true
+  vars_files:
+    - defaults/main.yml
+
+  tasks:
+  - name: install repo percona
+    yum:
+      name: https://repo.percona.com/yum/percona-release-latest.noarch.rpm
+      state: present
+  - name: install Percona-Server-server-57
+    yum:
+      name:
+        - Percona-Server-server-57
+        - MySQL-python
+  
+  - name: copy 01-base.cnf
+    template:
+      src: conf/01-base.cnf
+      dest: /etc/my.cnf.d/01-base.cnf
+      owner: mysql
+      group: mysql
+
+  - name: copy files
+    copy:
+      src: conf/{{ item }}
+      dest: /etc/my.cnf.d/
+      owner: mysql
+      group: mysql
+    with_items:
+      - 02-max-connections.cnf
+      - 03-performance.cnf
+      - 04-slow-query.cnf
+      - 05-binlog.cnf
+
+  - name: replication ignore on slave
+    blockinfile:
+      path: /etc/my.cnf.d/05-binlog.cnf
+      insertafter: EOF
+      block: |
+        replicate-ignore-table=bet.events_on_demand
+        replicate-ignore-table=bet.v_same_event
+    when: ansible_hostname=='slave'
+
+  - name: start mysql
+    systemd:
+      name: mysql
+      state: started
+      enabled: yes  
+  
+  - name: find mysql password
+    shell:
+      cmd: cat /var/log/mysqld.log | grep 'root@localhost:' | awk '{print $11}'
+    register: root_password
+
+  - name: update password
+    #command: mysql --user root --password='{{ root_password.stdout }}' --connect-expired-password --execute="ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password }}';"
+    shell: 
+      mysql --connect-expired-password -u 'root' -p'{{ root_password.stdout }}' -e 'ALTER USER USER() IDENTIFIED BY "{{ mysql_root_password }}";'
+    ignore_errors: true
+
+- hosts: master
+  become: true
+  vars_files:
+    - defaults/main.yml  
+  tasks:
+  - name: Create db
+    mysql_db:
+      name: bet
+      state: present
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+  - name: Restore database
+    mysql_db:
+      name: bet
+      state: import
+      target: /vagrant/bet.dmp
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+  - name: create repl user
+    mysql_user:
+      name: repl
+      password: "{{ mysql_repl_password }}"
+      priv: '*.*:ALL,GRANT'
+      state: present
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+  
+  - name: GRANT REPLICATION SLAVE
+    command: mysql -uroot --password='{{ mysql_root_password }}' -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%' IDENTIFIED BY '{{ mysql_repl_password }}'"
+  
+  - name: dump database
+    shell: mysqldump --all-databases --triggers --routines --master-data --ignore-table=bet.events_on_demand --ignore-table=bet.v_same_event -uroot --password='{{ mysql_root_password }}' > /tmp/master.sql
+    ignore_errors: true
+
+  - name: Copy dump
+    fetch:
+      src: /tmp/master.sql
+      dest: ./
+      flat: yes
+
+- hosts: slave
+  become: true
+  vars_files:
+    - defaults/main.yml  
+  tasks:
+
+  
+  - name: Restore database
+    ansible.builtin.mysql_db:
+      name: bet
+      state: import
+      target: /vagrant/master.sql
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+    ignore_errors: true
+
+
+
+ # - name: Setup and run slave
+  #  shell:
+   #   mysql -uroot -p'{{ mysql_root_password }}' -e "STOP SLAVE; CHANGE MASTER TO MASTER_HOST ='192.168.11.150', MASTER_PORT = 3306, MASTER_USER = 'repl', MASTER_PASSWORD = '{{ mysql_repl_password }}', MASTER_AUTO_POSITION = 1; START SLAVE;"
